@@ -13,6 +13,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app import main
+from app.database import remove_database_files
 from app.portable import target_is_blank
 
 SQUARE = [[0, 0], [10, 0], [10, 10], [0, 10]]
@@ -24,14 +25,13 @@ def _cleanup_db():
     main.db and main.db.conn.close()
     fd, path = tempfile.mkstemp(suffix=".db")
     os.close(fd)
-    os.unlink(path)  # DB( 自己创建文件，确保「首次初始化」路径真实
+    remove_database_files(path)  # DB( 自己创建文件，确保「首次初始化」路径真实（含 WAL/SHM）
     main.DB_PATH = path
     yield path
     if main.db is not None:
         main.db.conn.close()
         main.db = None
-    if os.path.exists(path):
-        os.unlink(path)
+    remove_database_files(path)
 
 
 def _restart(seed: bool):
@@ -189,7 +189,7 @@ def test_imported_database_not_reseeded_and_blank_judgment_kept(_cleanup_db):
     main.SEED_DEMO_DATA = True
     with TestClient(main.app) as src:
         pkg = src.get("/api/transfer/export").json()
-    os.unlink(src_path)
+    remove_database_files(src_path)
 
     # 目标为全新 SEED=0 空白库：可导入
     main.DB_PATH = dst_path

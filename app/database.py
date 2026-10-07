@@ -6,9 +6,15 @@ group_id 为 NULL 表示孤片（独立状态）；同组碎片共享同一 grou
 （取组内最小碎片 id，撤销关系后按剩余关系重算连通分量得到）。
 
 每次成功变更（录入/删除碎片、采纳/撤销拼接、试拼确认、轮廓修订确认、
-锚点整体校准确认、版本恢复）都在同一事务内把完整装配状态（碎片、关系、
-连通组）写入 snapshots 表，版本号即快照主键，快照一经写入不再修改或删除；
-服务启动且尚无快照时，把当前状态记为基线快照。预览与失败操作不写快照。
+锚点整体校准确认、版本恢复）都在同一写事务（DB.write_transaction：进程锁 +
+BEGIN IMMEDIATE，多实例共用库时按提交顺序串行化，busy_timeout 等锁）内
+复核期望版本与业务条件、写入状态、按原规则重算连通组、把版本递增一次并把完整
+装配状态（碎片、关系、连通组）写入 snapshots 表，版本号即快照主键，快照一经
+写入不再修改或删除；成功回执也在该事务内构造，版本与装配均对应本次提交。
+服务启动且尚无快照时，把当前状态记为基线快照。预览、失败操作与只读查看
+（历史、间隙、补配评估、导出）不写库、不写快照；任何写失败都整体回滚，
+不留部分状态、版本或快照。空白库迁移导入走同一写事务边界，但保留包内原版本
+与原快照，不额外递增（见 import_package）。
 """
 from __future__ import annotations
 
@@ -16,7 +22,13 @@ import json
 import os
 import sqlite3
 import threading
+from contextlib import contextmanager
 from datetime import datetime, timezone
+
+# 多服务实例（多进程）共用同一数据库时，BEGIN IMMEDIATE 写入事务先按本
+# PRAGMA 排队等锁，而非立即 database is locked：写事务因此严格按获得库锁的顺序
+# （即提交顺序）串行化，事务内复核期望版本即可按提交顺序判定过期版本。
+BUSY_TIMEOUT_MS = 10000
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS fragments (
@@ -57,6 +69,19 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
+def remove_database_files(path: str):
+    """删除 SQLite 数据库主文件及 WAL / SHM 旁路文件（仅测试重置空白库用）。
+
+    WAL 模式下数据可能尚未合并入主文件，仅删除主文件会让新库错误继承
+    旧库残留的 -wal/-shm 内容；三者须一并删除才等于「从未初始化的库」。
+    """
+    for suffix in ("", "-wal", "-shm"):
+        try:
+            os.remove(path + suffix)
+        except FileNotFoundError:
+            pass
+
+
 class DB:
     def __init__(self, path: str):
         self.path = path
@@ -64,6 +89,9 @@ class DB:
         os.makedirs(parent, exist_ok=True)
         self.conn = sqlite3.connect(path, check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
+        # 写事务锁等待上限：多实例共用库时按提交顺序排队，不立即报 locked
+        self.conn.execute(f"PRAGMA busy_timeout = {BUSY_TIMEOUT_MS}")
+        self.conn.execute("PRAGMA journal_mode = WAL")
         self.conn.execute("PRAGMA foreign_keys = ON")
         # 建表前探测是否为从未初始化的数据库 —— 只有全新库才允许在启动时
         # 播种演示数据；既有库（哪怕碎片已删空 / 历史恢复到空装配 / 迁移
@@ -100,6 +128,29 @@ class DB:
         self.conn.execute(
             "UPDATE meta SET value = ? WHERE key = 'version'", (str(v),))
         return v
+
+    @contextmanager
+    def write_transaction(self):
+        """可复用的装配写事务边界。
+
+        先取进程内可重入锁，再以 BEGIN IMMEDIATE 取得数据库级写锁
+        （多实例共用同一 SQLite 文件时，写事务按获锁先后=提交先后串行化，
+        配合 busy_timeout 等待而非立即 locked）。with 块内即唯一写边界：
+        业务方在其中复核期望版本与业务条件、写入状态、按原规则更新分组、
+        递增一次版本并固化同版不可改快照；任何异常都整体回滚——失败不留
+        部分状态、版本或快照；正常退出才提交。块内读到的即本连接视角下
+        含未提交改动的数据，成功回执必须在此块内构造，确保版本与装配
+        对应本次提交，而不是提交后被其他实例再次变更后的结果。
+        """
+        with self.lock:
+            self.conn.execute("BEGIN IMMEDIATE")
+            try:
+                yield
+            except Exception:
+                self.conn.rollback()
+                raise
+            else:
+                self.conn.commit()
 
     # ------------------------------------------------------------ 行转换
 

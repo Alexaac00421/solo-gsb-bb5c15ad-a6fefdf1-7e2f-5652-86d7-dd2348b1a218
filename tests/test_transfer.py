@@ -19,14 +19,16 @@ os.environ["DATABASE_PATH"] = SRC_DB
 os.environ["SEED_DEMO_DATA"] = "1"
 
 from app import main  # noqa: E402
+from app.database import remove_database_files  # noqa: E402
 from app.main import app  # noqa: E402
 
 
 @pytest.fixture(scope="module")
 def src():
     # 显式重置为全新源库：与同进程内其他测试模块（test_gaps 等）的库隔离
-    if os.path.exists(SRC_DB):
-        os.unlink(SRC_DB)
+    if main.db is not None:
+        main.db.conn.close()
+    remove_database_files(SRC_DB)
     main.SEED_DEMO_DATA = True
     main.DB_PATH = SRC_DB
     with TestClient(app) as c:   # 进入 lifespan：按 main.DB_PATH 建库并播演示数据
@@ -75,10 +77,9 @@ def package(src):
 
 def _open_dst():
     """切到空白目标库（不播演示数据），返回其 TestClient。"""
-    if os.path.exists(DST_DB):
-        os.unlink(DST_DB)
     if main.db is not None:
         main.db.conn.close()
+    remove_database_files(DST_DB)
     main.SEED_DEMO_DATA = False
     main.DB_PATH = DST_DB
     main.db = main.DB(DST_DB)

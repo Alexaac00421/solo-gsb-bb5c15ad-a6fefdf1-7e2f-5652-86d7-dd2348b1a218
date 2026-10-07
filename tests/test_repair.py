@@ -22,6 +22,7 @@ import pytest  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 
 from app import main  # noqa: E402
+from app.database import remove_database_files  # noqa: E402
 from app.main import app  # noqa: E402
 from app.repair import evaluate_repair, validate_target  # noqa: E402
 
@@ -29,10 +30,9 @@ from app.repair import evaluate_repair, validate_target  # noqa: E402
 @pytest.fixture(scope="module")
 def client():
     # 显式重置为全新库：与同进程内其他测试模块（test_gaps 等）的库隔离
-    if os.path.exists(_DB_PATH):
-        os.unlink(_DB_PATH)
     if main.db is not None:
         main.db.conn.close()
+    remove_database_files(_DB_PATH)
     main.SEED_DEMO_DATA = True
     main.DB_PATH = _DB_PATH
     with TestClient(app) as c:

@@ -19,6 +19,8 @@ os.environ["SEED_DEMO_DATA"] = "1"
 
 from fastapi.testclient import TestClient  # noqa: E402
 
+from app import main  # noqa: E402
+from app.database import remove_database_files  # noqa: E402
 from app.main import app  # noqa: E402
 
 import pytest  # noqa: E402
@@ -26,6 +28,12 @@ import pytest  # noqa: E402
 
 @pytest.fixture(scope="module")
 def client():
+    # 显式重置为全新库：与同进程内其他测试模块的库隔离
+    if main.db is not None:
+        main.db.conn.close()
+    remove_database_files(_DB_PATH)
+    main.SEED_DEMO_DATA = True
+    main.DB_PATH = _DB_PATH
     with TestClient(app) as c:
         yield c
 
