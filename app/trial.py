@@ -501,7 +501,12 @@ def simulate(d, steps) -> dict:
 
 
 def commit_actions(d, sim: dict) -> dict[int, int]:
-    """在当前事务内把预演过的动作序列落库。返回临时 key / client_id → 真实 id。"""
+    """在当前装配提交事务内把预演过的动作序列落库。
+
+    返回 client_id → 真实 id 映射；连通组由装配提交边界
+    （DB.assembly_commit）在全部动作写入后统一重算，本函数不自行重算，
+    保证「写入状态 → 重算分组 → 版本 +1 → 同版快照」处于同一事务。
+    """
     key_to_rid: dict[int, int] = {}
     cid_to_rid: dict[str, int] = {}
     for act in sim["actions"]:
@@ -518,5 +523,4 @@ def commit_actions(d, sim: dict) -> dict[int, int]:
             key = act["key"]
             rid = key_to_rid.get(key, key)   # 负数=序列内新建，需映射
             d.undo_relation(rid)
-    d.recompute_groups()
     return cid_to_rid

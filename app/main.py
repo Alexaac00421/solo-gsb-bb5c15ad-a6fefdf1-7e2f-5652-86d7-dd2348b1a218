@@ -8,7 +8,19 @@
 - 同组内新增关系（闭环）必须符合已有位姿；
 - 任何校验失败整次拒绝，原拼接组不变；
 - 撤销关系后按剩余关系重算连通组，孤片恢复独立状态；
-- 采纳/撤销携带期望版本号，过期版本返回 409 冲突；
+- 采纳/撤销携带期望版本号，过期版本返回 409 冲突。
+
+装配提交边界（本轮统一收束，详见 database.py 的 read_tx / write_tx /
+assembly_commit）：录入/删除碎片、采纳/撤销关系、试拼确认、轮廓修订确认、
+组校准确认、历史恢复全部在**同一个写事务**内完成「复核适用的期望版本 →
+复核各自业务条件 → 写入状态 → 按原规则更新分组 → 只递增一次版本 → 固化
+同版不可改快照 → 提交」，成功回执里的 version 与 assembly 均取自该事务内
+提交时刻的结果，与本次提交严格对应；任一校验失败或版本过期整体回滚，
+失败与预览不留任何部分状态、版本或快照。写事务用 BEGIN IMMEDIATE 立即取
+SQLite 库级写锁并设置 busy_timeout，多个服务实例共用同一数据库文件时也按
+提交顺序串行判定过期版本；锁等待超时返回 503（事务已整体取消，可重试）。
+只读接口（当前装配、历史查看、间隙/补配评估、导出与各类预览）在同一读事务
+内取齐数据，保持只读。
 - 有序试拼（/api/trials/rehearse）基于版本快照逐步推演，不落库；
   确认（/api/trials/commit）整体提交，任一步失败或版本过期均不写入，
   成功仅递增一次装配版本（详见 trial.py）。
@@ -27,9 +39,10 @@
   完整装配（碎片/关系/连通组）固化为不可改版本快照；启用时当前状态记为
   基线。可查看任意历史版的碎片轮廓、位姿、有效及已撤销关系与连通组；
   恢复前先预览恢复后的完整装配及其与当前版的碎片/关系差异（不写库），
-  确认须提交预览所依据的当前版本号，版本过期或目标版不存在均拒绝且不
-  写入；成功时原子恢复该版碎片与关系的原 ID 及状态、重算连通组，装配
-  版本只递增一次并留下新快照，旧快照仍可查（详见 history.py）。
+  确认须提交预览所依据的当前版本号（在写事务内复核），版本过期或目标版
+  不存在均拒绝且不写入；成功时原子恢复该版碎片与关系的原 ID 及状态、
+  重算连通组，装配版本只递增一次并留下新快照，旧快照仍可查
+  （详见 history.py）。
 - 陶片对间隙查询（/api/assembly/versions/{v}/gaps）：修复师选择一个装配
   版本与若干陶片对，系统依据该版本快照的固定轮廓与位姿逐对计算轮廓边界
   的最短间隙、对应最近点坐标及是否内部重叠，按间隙从小到大、陶片编号
@@ -49,11 +62,12 @@
 - 离线工作站迁移（/api/transfer/export、/api/transfer/import/preview|
   confirm）：导出当前装配及全部不可改快照为带格式版本号的 JSON 包
   （只读）；导入先预览包内碎片、有效及已撤销关系、版本数与导入后装配
-  （不写库），确认须携带目标库当前装配版本，在单一事务内保留碎片/关系
-  原 ID、轮廓、位姿、标记、状态、时间戳及各快照原版本号（导入不新增版本
-  与快照）；目标库仅允许无碎片无关系的空白基线，该基线由包整包替换。
-  格式版本不支持、轮廓无效、关系引用缺失、快照版本重复/缺号、末版与包内
-  当前装配不一致均整包拒绝并列出原因；目标版本过期 409，库与历史原状
+  （不写库），确认须携带目标库当前装配版本（在写事务内复核，过期 409），
+  在单一写事务内保留碎片/关系原 ID、轮廓、位姿、标记、状态、时间戳及各
+  快照原版本号；**导入不经过装配提交边界**：不额外递增版本、不新增快照
+  （导入不新增版本与快照）；目标库仅允许无碎片无关系的空白基线，该基线
+  由包整包替换。格式版本不支持、轮廓无效、关系引用缺失、快照版本重复/
+  缺号、末版与包内当前装配不一致均整包拒绝并列出原因；库与历史原状
   （详见 portable.py、DB.import_package）。
 """
 from __future__ import annotations
@@ -61,17 +75,19 @@ from __future__ import annotations
 import json
 import math
 import os
+import sqlite3
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Literal, Union
 
 from fastapi import FastAPI, HTTPException, Response
+from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from . import calibration, gaps, geometry, history, portable, repair, revision, trial
 from .calibration import CalibrationError, evaluate_calibration
-from .database import DB
+from .database import DB, VersionConflict
 from .portable import PackageError
 from .repair import RepairError, evaluate_repair
 from .revision import RevisionError, evaluate_revision
@@ -211,6 +227,11 @@ def _check_version(d: DB, expected: int):
                  f"您基于 v{expected} 的操作已过期，请刷新后重试")
 
 
+def _conflict_http(e: VersionConflict) -> HTTPException:
+    """把装配提交边界在事务内判定的版本过期翻译为既有 409 回执（兼容原细节）。"""
+    return HTTPException(409, str(e))
+
+
 # ---------------------------------------------------------------- 应用生命周期
 
 def seed_demo(d: DB):
@@ -227,14 +248,13 @@ def seed_demo(d: DB):
         ("陶片C", [[0, 0], [40, 0], [35, 25], [10, 30]]),
         ("陶片D", [[0, 0], [30, 5], [25, 35], [-5, 20]]),
     ]
-    with d.lock:
+    with d.write_tx():
         for name, contour in demo:
             d.insert_fragment(name, contour)
         d.recompute_groups()
         v = d.bump_version()
         # 演示数据为启用版本历史后的首个状态：记为基线快照
         d.save_snapshot(v, "baseline", d.assembly_state(), ignore=True)
-        d.conn.commit()
 
 
 def ensure_baseline(d: DB):
@@ -243,12 +263,11 @@ def ensure_baseline(d: DB):
     兼容升级已有数据库：快照表为空时以当前版本补记一条不可改基线快照；
     已存在快照（如演示数据已在 seed_demo 内记录）则保留原快照不动。
     """
-    with d.lock:
+    with d.write_tx():
         if d.has_snapshot():
             return
         v = d.version()
         d.save_snapshot(v, "baseline", d.assembly_state(), ignore=True)
-        d.conn.commit()
 
 
 @asynccontextmanager
@@ -269,6 +288,22 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="陶片拼接系统", version="1.0.0", lifespan=lifespan)
 
 
+@app.exception_handler(sqlite3.OperationalError)
+async def _sqlite_locked_handler(_request, exc: sqlite3.OperationalError):
+    """多实例共用库且等待写锁超过 busy_timeout：事务已整体回滚。
+
+    返回 503（可重试）而非 500，提示修复师稍后按当前版本重试；不留部分
+    状态、版本或快照。其它 OperationalError（非锁竞争）同样不泄露内部细节。
+    """
+    msg = str(exc)
+    locked = "locked" in msg.lower() or "busy" in msg.lower()
+    return JSONResponse(
+        status_code=503 if locked else 500,
+        content={"detail": (
+            "数据库正被其他工作站占用，本次操作已整体取消（未写入任何变化、"
+            "版本与快照不变），请刷新到当前版本后重试"
+            if locked else "内部错误，本次操作未生效")})
+
 # ---------------------------------------------------------------- 碎片 API
 
 @app.post("/api/fragments", status_code=201)
@@ -278,43 +313,36 @@ def create_fragment(payload: FragmentIn):
         contour = geometry.validate_contour(payload.contour)
     except geometry.GeometryError as e:
         raise HTTPException(400, str(e))
-    with d.lock:
-        try:
-            d.conn.execute("BEGIN IMMEDIATE")
+    try:
+        # 录入不携带期望版本；版本/快照/分组在同一事务内完成，回执从事务内取
+        with d.assembly_commit("create", None) as c:
             fid = d.insert_fragment(payload.name.strip(), contour)
-            v = d.bump_version()
-            d.save_snapshot(v, "create", d.assembly_state())
-            d.conn.commit()
-        except Exception:
-            d.conn.rollback()
-            raise
-        return {"ok": True, "fragment": d.get_fragment(fid),
-                "version": v}
+            c.result = {"fragment": d.get_fragment(fid)}
+    except VersionConflict as e:   # 录入无期望版本，理论上不会到达
+        raise _conflict_http(e)
+    return {"ok": True, **c.result, "version": c.new_version,
+            "assembly": c.assembly}
 
 
 @app.get("/api/fragments")
 def list_fragments():
-    return get_db().all_fragments()
+    d = get_db()
+    with d.read_tx():
+        return d.all_fragments()
 
 
 @app.delete("/api/fragments/{fid}")
 def delete_fragment(fid: int, expected_version: int):
     d = get_db()
-    with d.lock:
-        try:
-            d.conn.execute("BEGIN IMMEDIATE")
-            _check_version(d, expected_version)
+    try:
+        with d.assembly_commit("delete", expected_version) as c:
             if d.get_fragment(fid) is None:
                 raise HTTPException(404, f"碎片 #{fid} 不存在")
             d.delete_fragment(fid)
-            d.recompute_groups()
-            v = d.bump_version()
-            d.save_snapshot(v, "delete", d.assembly_state())
-            d.conn.commit()
-        except Exception:
-            d.conn.rollback()
-            raise
-    return {"ok": True, "version": v, "assembly": d.assembly_state()}
+    except VersionConflict as e:
+        raise _conflict_http(e)
+    # version / assembly 均取自该事务提交时刻的状态，必与本次提交对应
+    return {"ok": True, "version": c.new_version, "assembly": c.assembly}
 
 
 # ---------------------------------------------------------------- 轮廓修订 API
@@ -362,7 +390,7 @@ def _revision_response(fid: int, expected_version: int, ev: dict) -> dict:
 def preview_revision(fid: int, payload: RevisionIn):
     """预览轮廓修订：逐条误差与冲突原因，不写库。版本过期返回 409。"""
     d = get_db()
-    with d.lock:
+    with d.read_tx():
         _check_version(d, payload.expected_version)
         if d.get_fragment(fid) is None:
             raise HTTPException(404, f"碎片 #{fid} 不存在")
@@ -379,13 +407,14 @@ def confirm_revision(fid: int, payload: RevisionIn):
     """确认轮廓修订：重新校验同一输入，原子更新轮廓/相关标记/误差。
 
     位姿、关系 ID、连通分组、已撤销历史保持不变；成功后装配版本只 +1。
-    校验失败整次拒绝（不写入任何变化）；版本过期返回 409。
+    校验失败整次拒绝（不写入任何变化）；版本过期返回 409。回执中的版本
+    与装配取自提交事务内的提交时刻状态。
     """
     d = get_db()
-    with d.lock:
-        try:
-            d.conn.execute("BEGIN IMMEDIATE")
-            _check_version(d, payload.expected_version)
+    try:
+        # 轮廓修订拓扑未变：边界内不重算分组（recompute=False）
+        with d.assembly_commit("revision", payload.expected_version,
+                               recompute=False) as c:
             if d.get_fragment(fid) is None:
                 raise HTTPException(404, f"碎片 #{fid} 不存在")
             rel_inputs = [(r.relation_id, r.markers) for r in payload.relations]
@@ -402,18 +431,10 @@ def confirm_revision(fid: int, payload: RevisionIn):
             for rid, up in ev["updates"].items():
                 d.update_relation_side(rid, up["side"], up["markers"],
                                        up["max_error"])
-            # 不调用 recompute_groups：分组必须保持不变
-            new_version = d.bump_version()
-            d.save_snapshot(new_version, "revision", d.assembly_state())
-            d.conn.commit()
-        except HTTPException:
-            d.conn.rollback()
-            raise
-        except Exception:
-            d.conn.rollback()
-            raise HTTPException(500, "内部错误，本次操作未生效")
-    return {"ok": True, "fragment_id": fid, "version": new_version,
-            "assembly": d.assembly_state()}
+    except VersionConflict as e:
+        raise _conflict_http(e)
+    return {"ok": True, "fragment_id": fid, "version": c.new_version,
+            "assembly": c.assembly}
 
 
 # ---------------------------------------------------------------- 锚点整体校准 API
@@ -492,7 +513,7 @@ def preview_calibration(payload: CalibrationIn):
     版本过期 → 409；锚点不存在 → 404；所在组不足两片 → 400。
     """
     d = get_db()
-    with d.lock:
+    with d.read_tx():
         _check_version(d, payload.expected_version)
         try:
             ev = evaluate_calibration(d, payload.anchor_id)
@@ -509,13 +530,14 @@ def confirm_calibration(payload: CalibrationIn):
     锚点位姿、轮廓、标记、关系状态与连通分组不变；仅当误差总量严格下降、
     每对对应点误差 ≤ 1 mm 且组内轮廓内部不重叠时才写入，版本只 +1 并留下
     source=calibration 的不可改快照；否则整次拒绝（不写入任何变化）。
-    版本过期 → 409；锚点不存在 → 404；组不足两片 → 400。
+    版本过期 → 409；锚点不存在 → 404；组不足两片 → 400。回执中的版本与
+    装配取自提交事务内的提交时刻状态。
     """
     d = get_db()
-    with d.lock:
-        try:
-            d.conn.execute("BEGIN IMMEDIATE")
-            _check_version(d, payload.expected_version)
+    try:
+        # 校准只改位姿，拓扑未变：边界内不重算分组（recompute=False）
+        with d.assembly_commit("calibration", payload.expected_version,
+                               recompute=False) as c:
             try:
                 ev = evaluate_calibration(d, payload.anchor_id)
             except CalibrationError as e:
@@ -532,18 +554,10 @@ def confirm_calibration(payload: CalibrationIn):
                 # 标记未变：仅刷新每条有效关系的最新最大误差
                 d.update_relation_side(
                     r["relation_id"], None, None, r["max_error_after"])
-            # 不调用 recompute_groups：拓扑未变，分组必须保持不变
-            new_version = d.bump_version()
-            d.save_snapshot(new_version, "calibration", d.assembly_state())
-            d.conn.commit()
-        except HTTPException:
-            d.conn.rollback()
-            raise
-        except Exception:
-            d.conn.rollback()
-            raise HTTPException(500, "内部错误，本次操作未生效")
+    except VersionConflict as e:
+        raise _conflict_http(e)
     return {"ok": True, "anchor_id": payload.anchor_id,
-            "version": new_version, "assembly": d.assembly_state()}
+            "version": c.new_version, "assembly": c.assembly}
 
 
 # ---------------------------------------------------------------- 拼接 API
@@ -552,7 +566,7 @@ def confirm_calibration(payload: CalibrationIn):
 def preview_relation(payload: PreviewIn):
     """预览：仅平移+旋转后的组合，返回各片位置、角度及冲突原因，不落库。"""
     d = get_db()
-    with d.lock:
+    with d.read_tx():
         fa, fb = _load_pair(d, payload.fragment_a, payload.fragment_b)
         ev = evaluate_proposal(d, fa, fb, payload.markers_a, payload.markers_b)
         if not ev["involved"]:
@@ -589,12 +603,14 @@ def preview_relation(payload: PreviewIn):
 
 @app.post("/api/relations", status_code=201)
 def accept_relation(payload: AcceptIn):
-    """采纳拼接：全部校验通过才落库，任一失败整次拒绝、原拼接组不变。"""
+    """采纳拼接：全部校验通过才落库，任一失败整次拒绝、原拼接组不变。
+
+    期望版本在写事务取得库级写锁后复核（多实例按提交顺序判定过期）；
+    回执中的版本与装配取自该事务提交时刻，必与本次采纳对应。
+    """
     d = get_db()
-    with d.lock:
-        try:
-            d.conn.execute("BEGIN IMMEDIATE")
-            _check_version(d, payload.expected_version)
+    try:
+        with d.assembly_commit("accept", payload.expected_version) as c:
             fa, fb = _load_pair(d, payload.fragment_a, payload.fragment_b)
             ev = evaluate_proposal(d, fa, fb, payload.markers_a, payload.markers_b)
             if not ev["ok"]:
@@ -606,28 +622,22 @@ def accept_relation(payload: AcceptIn):
                 d.update_pose(fid, pose)
             rid = d.insert_relation(fa["id"], fb["id"], ev["markers"][0],
                                     ev["markers"][1], max(ev["errors"]))
-            d.recompute_groups()
-            v = d.bump_version()
-            d.save_snapshot(v, "accept", d.assembly_state())
-            d.conn.commit()
-        except HTTPException:
-            d.conn.rollback()
-            raise
-        except Exception:
-            d.conn.rollback()
-            raise HTTPException(500, "内部错误，本次操作未生效")
-    return {"ok": True, "relation_id": rid, "version": v,
-            "assembly": d.assembly_state()}
+            c.result = {"relation_id": rid}
+    except VersionConflict as e:
+        raise _conflict_http(e)
+    return {"ok": True, **c.result, "version": c.new_version,
+            "assembly": c.assembly}
 
 
 @app.post("/api/relations/{rid}/undo")
 def undo_relation(rid: int, payload: UndoIn):
-    """撤销关系：按剩余关系重算连通组，孤片恢复独立状态。"""
+    """撤销关系：按剩余关系重算连通组，孤片恢复独立状态。
+
+    期望版本在写事务内复核，过期 → 409；回执版本/装配取自提交事务内。
+    """
     d = get_db()
-    with d.lock:
-        try:
-            d.conn.execute("BEGIN IMMEDIATE")
-            _check_version(d, payload.expected_version)
+    try:
+        with d.assembly_commit("undo", payload.expected_version) as c:
             rel = d.get_relation(rid)
             if rel is None:
                 raise HTTPException(404, f"拼接关系 #{rid} 不存在")
@@ -635,28 +645,24 @@ def undo_relation(rid: int, payload: UndoIn):
                 raise HTTPException(
                     409, f"版本冲突：拼接关系 #{rid} 已被撤销，请刷新后重试")
             d.undo_relation(rid)
-            d.recompute_groups()
-            v = d.bump_version()
-            d.save_snapshot(v, "undo", d.assembly_state())
-            d.conn.commit()
-        except HTTPException:
-            d.conn.rollback()
-            raise
-        except Exception:
-            d.conn.rollback()
-            raise HTTPException(500, "内部错误，本次操作未生效")
-    return {"ok": True, "version": v, "assembly": d.assembly_state()}
+    except VersionConflict as e:
+        raise _conflict_http(e)
+    return {"ok": True, "version": c.new_version, "assembly": c.assembly}
 
 
 @app.get("/api/relations")
 def list_relations():
-    return get_db().all_relations()
+    d = get_db()
+    with d.read_tx():
+        return d.all_relations()
 
 
 @app.get("/api/assembly")
 def get_assembly():
-    """当前装配快照：版本号、碎片位姿、连通组、全部关系。"""
-    return get_db().assembly_state()
+    """当前装配快照：版本号、碎片位姿、连通组、全部关系（同一读事务内取齐）。"""
+    d = get_db()
+    with d.read_tx():
+        return d.assembly_state()
 
 
 # ---------------------------------------------------------------- 有序试拼
@@ -681,7 +687,7 @@ def rehearse_trial(payload: TrialIn):
     前一刻）的位姿与分组。版本过期返回 409。
     """
     d = get_db()
-    with d.lock:
+    with d.read_tx():
         _check_version(d, payload.expected_version)
         try:
             sim = trial.simulate(d, payload.steps)
@@ -694,13 +700,13 @@ def rehearse_trial(payload: TrialIn):
 def commit_trial(payload: TrialIn):
     """确认试拼：同一版本 + 同一操作序列整体提交。
 
-    任一步失败或版本过期均不写入任何变化；全部成功仅递增一次装配版本。
+    任一步失败或版本过期均不写入任何变化（事务整体回滚）；全部成功仅
+    递增一次装配版本并固化同版快照。版本复核在写事务取得库级写锁后进行
+    （多实例按提交顺序判定过期）；回执版本/装配取自提交事务内。
     """
     d = get_db()
-    with d.lock:
-        try:
-            d.conn.execute("BEGIN IMMEDIATE")
-            _check_version(d, payload.expected_version)
+    try:
+        with d.assembly_commit("trial", payload.expected_version) as c:
             try:
                 sim = trial.simulate(d, payload.steps)
             except TrialError as e:
@@ -714,17 +720,16 @@ def commit_trial(payload: TrialIn):
                            if k != "http_status"},
                     })
             cid_map = trial.commit_actions(d, sim)
-            new_version = d.bump_version()
-            d.save_snapshot(new_version, "trial", d.assembly_state())
-            d.conn.commit()
-        except HTTPException:
-            d.conn.rollback()
-            raise
-        except Exception:
-            d.conn.rollback()
-            raise HTTPException(500, "内部错误，本次操作未生效")
-    return {"ok": True, "version": new_version, "committed_steps": len(sim["steps"]),
-            "relation_ids": cid_map, "assembly": d.assembly_state()}
+            c.result = {
+                "committed_steps": len(sim["steps"]),
+                "relation_ids": cid_map,
+            }
+    except VersionConflict as e:
+        raise _conflict_http(e)
+    return {"ok": True, "version": c.new_version,
+            "committed_steps": c.result["committed_steps"],
+            "relation_ids": c.result["relation_ids"],
+            "assembly": c.assembly}
 
 
 # ---------------------------------------------------------------- 历史版本
@@ -754,13 +759,13 @@ def list_versions():
     快照不可改、不可删；基线（启用时记录）为最早一条。
     """
     d = get_db()
-    with d.lock:
+    with d.read_tx():
         items = d.list_snapshot_versions()
         current = d.version()
-    for it in items:
-        it["source_label"] = history.source_label(it["source"])
-        it["current"] = it["version"] == current
-    return {"current_version": current, "versions": items}
+        for it in items:
+            it["source_label"] = history.source_label(it["source"])
+            it["current"] = it["version"] == current
+        return {"current_version": current, "versions": items}
 
 
 @app.get("/api/assembly/versions/{version}")
@@ -770,7 +775,7 @@ def get_version(version: int):
     只读，不改当前数据。目标版本快照不存在 → 404 version_not_found。
     """
     d = get_db()
-    with d.lock:
+    with d.read_tx():
         source, created_at, snap = _load_snapshot(d, version)
         return history.build_history_view(version, source, created_at, snap)
 
@@ -787,7 +792,7 @@ def query_gaps(version: int, payload: GapsIn):
     间隙为 0 表示接触；负值（-1）仅标识内部重叠，不得当作可用间隙。
     """
     d = get_db()
-    with d.lock:
+    with d.read_tx():
         try:
             pairs = gaps.validate_pairs(version, payload.pairs)
         except gaps.GapError as e:
@@ -827,7 +832,7 @@ def repair_assessment(version: int, payload: RepairIn):
     version_not_found；锚片在该版不存在 → 404 anchor_not_found。
     """
     d = get_db()
-    with d.lock:
+    with d.read_tx():
         try:
             repair.validate_anchor(payload.anchor_id)
             target_points = repair.validate_target(payload.target_contour)
@@ -852,7 +857,7 @@ def preview_restore(version: int, payload: RestoreIn):
     目标版即当前版 → 400（无需恢复）。
     """
     d = get_db()
-    with d.lock:
+    with d.read_tx():
         _check_version(d, payload.expected_version)
         source, created_at, snap = _load_snapshot(d, version)
         if version == d.version():
@@ -870,44 +875,34 @@ def preview_restore(version: int, payload: RestoreIn):
 def confirm_restore(version: int, payload: RestoreIn):
     """确认恢复：原子恢复目标版碎片与关系的原 ID 及状态。
 
-    - 必须提交预览所依据的当前版本号（expected_version），过期 → 409；
+    - 必须提交预览所依据的当前版本号（expected_version），在写事务取得
+      库级写锁后复核，过期 → 409（多实例按提交顺序判定）；
     - 目标版快照不存在 → 404，不写入；目标版即当前版 → 400，不写入；
     - 成功后重算连通组，装配版本只 +1，并留下 source=restore 的新快照；
       旧快照全部保留仍可查；关系与碎片的原 ID、active/undone_at/created_at
       及轮廓、标记、位姿均按该版原样恢复。
+    - 回执中的新版本与装配取自提交事务内的提交时刻状态。
     """
     d = get_db()
-    with d.lock:
-        try:
-            d.conn.execute("BEGIN IMMEDIATE")
-            _check_version(d, payload.expected_version)
+    try:
+        with d.assembly_commit("restore", payload.expected_version) as c:
             _source, _created_at, snap = _load_snapshot(d, version)
-            current = d.version()
-            if version == current:
+            if version == payload.expected_version:
                 raise HTTPException(
                     400, detail={
                         "message": f"目标版本 v{version} 即当前版本，无需恢复",
                         "code": "target_is_current",
-                        "current_version": current,
+                        "current_version": payload.expected_version,
                     })
             d.restore_state(snap)
-            d.recompute_groups()
-            new_version = d.bump_version()
-            restored = d.assembly_state()
-            d.save_snapshot(new_version, "restore", restored)
-            d.conn.commit()
-        except HTTPException:
-            d.conn.rollback()
-            raise
-        except Exception:
-            d.conn.rollback()
-            raise HTTPException(500, "内部错误，本次操作未生效")
+    except VersionConflict as e:
+        raise _conflict_http(e)
     return {
         "ok": True,
         "restored_from_version": version,
         "expected_version": payload.expected_version,
-        "version": new_version,
-        "assembly": restored,
+        "version": c.new_version,
+        "assembly": c.assembly,
     }
 
 
@@ -929,7 +924,7 @@ def export_package(download: bool = False):
     （文件名含导出时间与当前版本），否则直接返回 JSON。
     """
     d = get_db()
-    with d.lock:
+    with d.read_tx():
         exported_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
         pkg = portable.build_package(d, exported_at)
     body = json.dumps(pkg, ensure_ascii=False, indent=2).encode("utf-8")
@@ -953,7 +948,7 @@ def preview_import(payload: TransferPreviewIn):
     """
     d = get_db()
     pkg = _validate_package(payload.package)
-    with d.lock:
+    with d.read_tx():
         _is_blank, target = portable.target_is_blank(d)
     return portable.build_import_preview(pkg, target)
 
@@ -962,21 +957,23 @@ def preview_import(payload: TransferPreviewIn):
 def confirm_import(payload: TransferConfirmIn):
     """确认导入：单一事务内把整包写入空白目标库。
 
-    - 携带目标库当前装配版本 expected_version；过期 → 409，库与历史原状；
+    - 携带目标库当前装配版本 expected_version；在写事务取得库级写锁后
+      复核，过期 → 409（多实例按提交顺序判定），库与历史原状；
     - 目标库仅允许存在空白基线（无用户碎片 / 关系，基线快照也为空），
       该基线由导入包整包替换；非空白 → 400 target_not_blank；
     - 保留碎片 / 关系原 ID、轮廓、位姿、标记、状态（active/undone_at/
-      created_at）及全部快照原版本号、来源与快照时间戳；导入不产生新
-      版本号、不新增快照，装配版本置为包内 current_version；
+      created_at）及全部快照原版本号、来源与快照时间戳；导入**不**经过
+      装配提交边界：不产生新版本号、不额外递增、不新增快照，装配版本
+      原样置为包内 current_version；
     - 包本身格式版本不支持 / 轮廓无效 / 关系引用缺失 / 快照版本重复 /
       末版与包内当前装配不一致 → 400 整包拒绝并指出原因。
+    - 回执中的装配取自该导入事务提交时刻的状态。
     """
     d = get_db()
     pkg = _validate_package(payload.package)
-    with d.lock:
-        try:
-            d.conn.execute("BEGIN IMMEDIATE")
-            _check_version(d, payload.expected_version)
+    try:
+        with d.write_tx():
+            d.check_version(payload.expected_version)
             is_blank, target = portable.target_is_blank(d)
             if not is_blank:
                 raise HTTPException(400, detail={
@@ -986,19 +983,15 @@ def confirm_import(payload: TransferConfirmIn):
                 })
             d.import_package(pkg)
             d.recompute_groups()
-            d.conn.commit()
-        except HTTPException:
-            d.conn.rollback()
-            raise
-        except Exception:
-            d.conn.rollback()
-            raise HTTPException(500, "内部错误，导入未生效，库与历史保持原状")
+            imported_assembly = d.assembly_state()
+    except VersionConflict as e:
+        raise _conflict_http(e)
     return {
         "ok": True,
         "imported_version": pkg["current_version"],
         "snapshot_count": len(pkg["snapshots"]),
         "expected_version": payload.expected_version,
-        "assembly": d.assembly_state(),
+        "assembly": imported_assembly,
     }
 
 

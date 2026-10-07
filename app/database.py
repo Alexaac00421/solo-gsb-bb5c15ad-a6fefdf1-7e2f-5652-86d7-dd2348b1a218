@@ -9,6 +9,20 @@ group_id 为 NULL 表示孤片（独立状态）；同组碎片共享同一 grou
 锚点整体校准确认、版本恢复）都在同一事务内把完整装配状态（碎片、关系、
 连通组）写入 snapshots 表，版本号即快照主键，快照一经写入不再修改或删除；
 服务启动且尚无快照时，把当前状态记为基线快照。预览与失败操作不写快照。
+
+装配提交边界（多实例共用同一数据库文件时同样成立）：
+- ``read_tx``     只读边界：进程锁 + 单条读事务，保证一次请求内多语句读到
+                  同一版本，且与并发写事务按提交顺序互斥；
+- ``write_tx``    写边界：进程锁 + ``BEGIN IMMEDIATE`` 立即取得库级写锁，
+                  多个服务实例的写操作在 SQLite 层按拿锁顺序串行提交；
+- ``assembly_commit`` 可复用的装配提交边界：在**同一个写事务内**复核期望
+                  版本与各自业务条件、写入状态、按原规则重算分组（可按
+                  操作类型关闭）、递增一次版本、固化同版不可改快照并提交；
+                  成功回执（version / assembly）必须取自该事务内提交时刻
+                  的状态；任一步失败（含版本过期）一律回滚，不留部分状态、
+                  版本或快照。
+- 迁移导入走 ``write_tx`` 但**不**经 ``assembly_commit``：包内原版本与
+  快照原样保留，不额外递增版本（见 ``import_package``）。
 """
 from __future__ import annotations
 
@@ -16,7 +30,44 @@ import json
 import os
 import sqlite3
 import threading
+from contextlib import contextmanager
 from datetime import datetime, timezone
+
+# 多实例共用同一 SQLite 文件时，BEGIN IMMEDIATE 等待他人写锁的最长时间；
+# 超时仍拿不到锁才会抛 sqlite3.OperationalError("database is locked")。
+# 可用环境变量 SQLITE_BUSY_TIMEOUT_MS 覆盖（默认 10 秒）。
+BUSY_TIMEOUT_MS = int(os.environ.get("SQLITE_BUSY_TIMEOUT_MS", "10000"))
+
+
+class VersionConflict(Exception):
+    """装配提交边界在写事务内复核期望版本时发现版本过期。
+
+    由 API 层（main.py）统一翻译为 HTTP 409；携带提交时刻的真实当前版本，
+    保证多实例并发下也按提交顺序判定过期版本。
+    """
+
+    def __init__(self, expected: int, current: int):
+        super().__init__(
+            f"版本冲突：当前数据版本为 v{current}，"
+            f"您基于 v{expected} 的操作已过期，请刷新后重试")
+        self.expected = expected
+        self.current = current
+
+
+class _AssemblyCommit:
+    """assembly_commit 边界的提交结果载体。
+
+    new_version / assembly 在事务提交前（版本递增、快照固化的同一事务内）
+    写入，成功回执只能取这两个值；result 供端点携带本次提交特有的结果
+    （如新建碎片 / 关系 id、试拼 client_id 映射等）。
+    """
+
+    __slots__ = ("new_version", "assembly", "result")
+
+    def __init__(self):
+        self.new_version: int | None = None
+        self.assembly: dict | None = None
+        self.result: dict = {}
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS fragments (
@@ -65,6 +116,9 @@ class DB:
         self.conn = sqlite3.connect(path, check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA foreign_keys = ON")
+        # 多实例共用同一数据库文件：BEGIN IMMEDIATE 抢写锁时排队等待而非
+        # 立即报 "database is locked"，使版本过期判定严格按提交顺序进行。
+        self.conn.execute(f"PRAGMA busy_timeout = {BUSY_TIMEOUT_MS}")
         # 建表前探测是否为从未初始化的数据库 —— 只有全新库才允许在启动时
         # 播种演示数据；既有库（哪怕碎片已删空 / 历史恢复到空装配 / 迁移
         # 导入后的库）重启一律保持原状，不补种、不新增版本与快照。
@@ -100,6 +154,97 @@ class DB:
         self.conn.execute(
             "UPDATE meta SET value = ? WHERE key = 'version'", (str(v),))
         return v
+
+    # ------------------------------------------------------------ 事务边界
+
+    @contextmanager
+    def read_tx(self):
+        """只读边界：进程锁内开一条只读事务。
+
+        一次请求内的多条 SELECT 读到同一版本快照（BEGIN 后在 rollback
+        journal 下读事务持有共享锁，其他实例的写提交须等待其结束）；
+        绝不写入，因此以 ROLLBACK 结束，不改变任何数据、版本或快照。
+        调用方无需再自行 ``with self.lock``（本边界已获取，RLock 可重入）。
+        """
+        with self.lock:
+            self.conn.execute("BEGIN")
+            try:
+                yield
+            finally:
+                self.conn.rollback()
+
+    @contextmanager
+    def write_tx(self):
+        """写边界：进程锁 + ``BEGIN IMMEDIATE`` 立即取得库级写锁。
+
+        多个服务实例共用同一数据库文件时，SQLite 写锁保证同时只有一个
+        写事务：后来者在 busy_timeout 内排队，待前者 COMMIT 后取锁，因此
+        「复核期望版本 → 写入 → 递增版本 → 写快照」对其他实例严格按提交
+        顺序串行。块内抛异常（含 HTTPException / VersionConflict）一律
+        ROLLBACK，不留下部分状态、版本或快照。
+        """
+        with self.lock:
+            self.conn.execute("BEGIN IMMEDIATE")
+            try:
+                yield
+            except Exception:
+                self.conn.rollback()
+                raise
+            else:
+                self.conn.commit()
+
+    def check_version(self, expected: int | None = None):
+        """在当前写事务内复核期望版本；过期抛 VersionConflict。
+
+        expected=None 表示该操作不携带期望版本（录入碎片），不做复核。
+        必须在 ``write_tx`` 已取得写锁后调用 —— 此时读到的就是本次提交
+        所依据的最新版本，不受其他实例影响。
+        """
+        if expected is not None:
+            current = self.version()
+            if expected != current:
+                raise VersionConflict(expected, current)
+
+    @contextmanager
+    def assembly_commit(self, source: str, expected_version: int | None, *,
+                        recompute: bool = True):
+        """可复用的装配提交边界：所有「改动装配、版本 +1、留同版快照」写操作
+        （录入/删除碎片、采纳/撤销关系、试拼确认、轮廓修订确认、组校准确认、
+        历史恢复）统一在此收束。
+
+        固定流程（全部处于同一个 write_tx 事务内）：
+        1. BEGIN IMMEDIATE 取得库级写锁（多实例按提交顺序串行）；
+        2. 复核 expected_version（不携带则跳过，如录入碎片），过期抛
+           VersionConflict → API 层翻译为 409；
+        3. 执行业务回调（回调内再做各自业务条件校验与状态写入；校验失败
+           直接抛异常，外层回滚，不写入任何变化）；
+        4. 按原规则重算连通组（recompute=False 供轮廓修订 / 组校准，其
+           分组必须保持不变）；
+        5. 递增一次装配版本；
+        6. 在同一事务内固化该版本的完整装配快照（不可改）；
+        7. COMMIT，并把「提交时刻的新版本与装配状态」挂到边界对象上，
+           成功回执只能取这两个值，确保回执与本次提交严格对应。
+
+        用法::
+
+            with db.assembly_commit("accept", expected) as c:
+                ... 校验与写入 ...
+                c.result = {"relation_id": rid}
+            return {"ok": True, "version": c.new_version,
+                    "assembly": c.assembly, **c.result}
+
+        任何异常都整体回滚：不留下部分碎片/关系/分组状态、不递增版本、
+        不写快照。
+        """
+        commit = _AssemblyCommit()
+        with self.write_tx():
+            self.check_version(expected_version)
+            yield commit
+            if recompute:
+                self.recompute_groups()
+            commit.new_version = self.bump_version()
+            commit.assembly = self.assembly_state()
+            self.save_snapshot(commit.new_version, source, commit.assembly)
 
     # ------------------------------------------------------------ 行转换
 
